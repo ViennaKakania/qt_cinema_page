@@ -1,0 +1,113 @@
+QWidget {
+    background-color: #F7F7F8;
+    color: #222222;
+}
+
+QPushButton {
+    background-color: #6C63FF;
+    color: white;
+    border: none;
+    border-radius: 7px;
+    padding: 8px 15px;
+}
+
+QPushButton:hover {
+    background-color: #5A52D5;
+}
+
+QPushButton:pressed {
+    background-color: #4942B5;
+}
+
+QLineEdit {
+    background-color: white;
+    border: 1px solid #DDDDDD;
+    border-radius: 8px;
+    padding: 0 10px;
+    height: 36px;
+}
+
+QLineEdit:focus {
+    border: 1px solid #6C63FF;
+}
+
+QListWidget {
+    background-color: white;
+    border: 1px solid #DDDDDD;
+    border-radius: 8px;
+    padding: 5px;
+}
+
+QListWidget::item {
+    padding: 10px;
+    border-radius: 6px;
+}
+
+QListWidget::item:selected {
+    background-color: #6C63FF;
+    color: white;
+}
+
+
+
+
+/* ===== LoginPage ===== */
+
+QLabel#title {
+    font-size: 32px;
+    font-weight: bold;
+}
+
+QLabel#subtitle {
+    font-size: 14px;
+    color: #888888;
+}
+
+
+/* ===== RoomPage ===== */
+
+QLabel#pageTitle {
+    font-size: 24px;
+    font-weight: bold;
+}
+
+QLabel#username {
+    color: #777777;
+    font-size: 14px;
+}
+
+QLabel#roomTitle {
+    font-size: 18px;
+    font-weight: bold;
+}
+
+QLabel#roomInfoTitle {
+    font-size: 26px;
+    font-weight: bold;
+}
+
+
+/* ===== CinemaPage ===== */
+
+QLabel#roomInfo {
+    color: #777777;
+    font-size: 14px;
+}
+
+QFrame#videoArea {
+    background-color: #151515;
+    border-radius: 10px;
+}
+
+QSlider::groove:horizontal {
+    height: 5px;
+    background: #DDDDDD;
+    border-radius: 2px;
+}
+
+QSlider::handle:horizontal {
+    width: 12px;
+    margin: -4px 0;
+    border-radius: 6px;
+    background-color: #6C63FF;
+}
