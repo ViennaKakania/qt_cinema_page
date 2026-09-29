@@ -7,7 +7,7 @@
 #include <QPushButton>
 #include <QSpacerItem>
 
-LoginPage::LoginPage(QWidget *parent): QWidget(parent){
+LoginPage::LoginPage(QWidget* parent): QWidget(parent){
     auto* mainLayout = new QVBoxLayout(this);
     mainLayout->setContentsMargins(200, 100, 200, 50);
     mainLayout->setSpacing(15);
@@ -44,8 +44,11 @@ LoginPage::LoginPage(QWidget *parent): QWidget(parent){
 
 
 
-    auto slot = [this](){
-        emit loginSuccess();
+    auto slot = [this, usernameEdit](){
+        QString username = usernameEdit->text().trimmed();
+        if(!username.isEmpty()){
+            emit sigLoginRequested(username);
+        }
     };
     connect(loginButton, &QPushButton::clicked, this, slot);
 }

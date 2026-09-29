@@ -9,7 +9,7 @@ bool send_message(QTcpSocket* sock, MSG_type type, const string& msg){
 
     QByteArray block;
     QDataStream out(&block, QIODevice::WriteOnly);
-    out.setByteOrder(QDataStream::BigEndian); // 统一网络字节序，解决原代码跨平台隐患
+    out.setByteOrder(QDataStream::LittleEndian); // 统一网络字节序(linux平台默认是小端字节序)，解决原代码跨平台隐患
 
     // 序列化包头 + 包体
     out << static_cast<quint32>(type) << static_cast<quint32>(msg.size());
@@ -18,6 +18,7 @@ bool send_message(QTcpSocket* sock, MSG_type type, const string& msg){
     }
 
     qint64 written = sock->write(block);
+    sock->flush();
     // 如需严格阻塞等待“真正发完”，取消下行注释（勿在UI线程使用）
     // sock->waitForBytesWritten(-1);
     return (written == block.size());
@@ -41,7 +42,7 @@ bool recv_message(QTcpSocket* sock, Message& packet){
 
     // 2. 解析包头
     QDataStream in(headerBuf);
-    in.setByteOrder(QDataStream::BigEndian);
+    in.setByteOrder(QDataStream::LittleEndian);
     quint32 type, length;
     in >> type >> length;
 

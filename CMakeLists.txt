@@ -9,8 +9,13 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Network)
-find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Network)
+find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Network Multimedia)
+find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Network Multimedia)
+
+# FFmpeg
+set(FFMPEG_DIR "D:/FFmpeg")
+include_directories(${FFMPEG_DIR}/include)
+link_directories(${FFMPEG_DIR}/lib)
 
 set(PROJECT_SOURCES
         main.cpp
@@ -33,6 +38,10 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
         style.qss
         networkclient.h networkclient.cpp
         protocol.h protocol.cpp
+        FFmpegPlayer.h
+        FFmpegPlayer.cpp
+        ffmpegdecodethread.h ffmpegdecodethread.cpp
+
     )
 # Define target properties for Android with Qt 6 as:
 #    set_property(TARGET RemoteSynchroCinema APPEND PROPERTY QT_ANDROID_PACKAGE_SOURCE_DIR
@@ -52,7 +61,16 @@ else()
     endif()
 endif()
 
-target_link_libraries(RemoteSynchroCinema PRIVATE Qt${QT_VERSION_MAJOR}::Widgets Qt${QT_VERSION_MAJOR}::Network)
+target_link_libraries(RemoteSynchroCinema PRIVATE
+    Qt${QT_VERSION_MAJOR}::Widgets
+    Qt${QT_VERSION_MAJOR}::Network
+    Qt${QT_VERSION_MAJOR}::Multimedia
+    avformat
+    avcodec
+    avutil
+    swscale
+    swresample
+)
 
 # Qt for iOS sets MACOSX_BUNDLE_GUI_IDENTIFIER automatically since Qt 6.1.
 # If you are developing for iOS or macOS you should consider setting an

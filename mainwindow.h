@@ -3,6 +3,7 @@
 
 #include <QMainWindow>
 #include "networkclient.h"
+#include <QTimer>
 
 class QStackedWidget;
 class LoginPage;
@@ -12,6 +13,7 @@ class CinemaPage;
 class MainWindow: public QMainWindow
 {
     Q_OBJECT
+    QTimer* roomTimer;
 
 public:
     explicit MainWindow(QWidget* parent = nullptr);
@@ -36,6 +38,8 @@ private slots:
     void showRoomPage();
     void showCinemaPage();
     void showLoginPage();
+
+    void onLoginRequested(const QString& username);
 };
 
 #endif // MAINWINDOW_H
