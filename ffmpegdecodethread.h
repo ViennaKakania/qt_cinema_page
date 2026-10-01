@@ -27,12 +27,17 @@ public:
 
     // ===== 从视频队列取出一帧 =====
     bool getNextFrame(QImage& image, double& pts);
+    bool peekNextFrame(QImage& image, double& pts);
+    bool dropNextFrame();
 
 signals:
     // 只作为“有新帧”的通知，不直接传图像
     void frameAvailable();
 
     void decodeFinished();
+
+    void seekFinished(bool wasPlaying);
+
 
 protected:
     void run() override;
@@ -54,11 +59,12 @@ private:
     // ===== Seek =====
     bool seekRequested;
     double seekPosition;
+    bool wasPlayingBeforeSeek;
 
     // ===== 视频帧队列 =====
     QMutex queueMutex;
     QWaitCondition queueNotFull;
-    QWaitCondition queueNotEmpty;
+    //QWaitCondition queueNotEmpty;
     QQueue<QPair<QImage, double>> frameQueue;
 
     static constexpr int MAX_QUEUE_SIZE = 4;

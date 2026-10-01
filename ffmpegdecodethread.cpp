@@ -2,8 +2,10 @@
 #include "FFmpegPlayer.h"
 
 #include <QMutexLocker>
+#include <QDebug>
 
-FFmpegDecodeThread::FFmpegDecodeThread(FFmpegPlayer* player): player(player), stopRequested(false), playing(false), seekRequested(false), seekPosition(0.0){
+FFmpegDecodeThread::FFmpegDecodeThread(FFmpegPlayer* player): player(player), stopRequested(false), playing(false),
+    seekRequested(false), seekPosition(0.0), wasPlayingBeforeSeek(false){
 }
 
 
@@ -19,9 +21,13 @@ void FFmpegDecodeThread::startPlayback(){
         QMutexLocker locker(&mutex);
 
         playing = true;
-
-        condition.wakeAll();
     }
+
+    // 唤醒正在等待播放状态的线程
+    condition.wakeAll();
+
+    // 唤醒可能因为队列满而等待的线程
+    queueNotFull.wakeAll();
 
     if(player){
         player->play();
@@ -37,6 +43,9 @@ void FFmpegDecodeThread::pausePlayback(){
         playing = false;
     }
 
+    // 防止解码线程卡在 queueNotFull.wait()
+    queueNotFull.wakeAll();
+
     if(player){
         player->pause();
     }
@@ -48,11 +57,21 @@ void FFmpegDecodeThread::requestSeek(double seconds){
     {
         QMutexLocker locker(&mutex);
 
+        // 记录Seek之前是否正在播放
+        wasPlayingBeforeSeek = playing;
+
+        // 暂停当前解码
+        playing = false;
+
         seekPosition = seconds;
         seekRequested = true;
     }
 
+    // 唤醒正常播放状态等待
     condition.wakeAll();
+
+    // 如果线程正在等待队列空间，也必须唤醒
+    queueNotFull.wakeAll();
 }
 
 
@@ -67,7 +86,7 @@ void FFmpegDecodeThread::stopThread(){
 
     condition.wakeAll();
     queueNotFull.wakeAll();
-    queueNotEmpty.wakeAll();
+    //queueNotEmpty.wakeAll();
 }
 
 
@@ -107,6 +126,30 @@ bool FFmpegDecodeThread::getNextFrame(QImage& image, double& pts){
     return true;
 }
 
+bool FFmpegDecodeThread::peekNextFrame(QImage& image, double& pts){
+    QMutexLocker locker(&queueMutex);
+
+    if(frameQueue.isEmpty()) return false;
+
+    const auto& frame = frameQueue.head();
+
+    image = frame.first;
+    pts = frame.second;
+
+    return true;
+}
+
+bool FFmpegDecodeThread::dropNextFrame(){
+    QMutexLocker locker(&queueMutex);
+
+    if(frameQueue.isEmpty()) return false;
+
+    frameQueue.dequeue();
+
+    queueNotFull.wakeOne();
+
+    return true;
+}
 
 // ===== 线程入口 =====
 void FFmpegDecodeThread::run(){
@@ -116,115 +159,84 @@ void FFmpegDecodeThread::run(){
     }
 
     while(true){
-        // ===== 检查停止状态 =====
+        // ===== 1. 停止 =====
         {
             QMutexLocker locker(&mutex);
-
-            if(stopRequested){
-                break;
-            }
+            if(stopRequested) break;
         }
 
-
-        // ===== 处理Seek请求 =====
+        // ===== 2. Seek =====
         bool doSeek = false;
-        double targetPosition = 0.0;
-
+        double target = 0.0;
         {
             QMutexLocker locker(&mutex);
-
-            if(seekRequested){
-                doSeek = true;
-                targetPosition = seekPosition;
-                seekRequested = false;
-            }
+            if(seekRequested){ doSeek = true; target = seekPosition; seekRequested = false; }
         }
 
         if(doSeek){
-            // Seek必须由解码线程执行
-            player->pause();
+            bool resume = false;
+            {
+                QMutexLocker locker(&mutex);
+                resume = wasPlayingBeforeSeek;
+            }
 
             clearFrameQueue();
 
-            if(!player->seek(targetPosition)){
-                continue;
-            }
+            // 不调用 player->pause()/play()：QAudioSink 只能在 GUI 线程操作。
+            // 暂停与恢复由 CinemaPage 在收到 seekFinished 前后分别处理。
+            player->seek(target);
 
-            // Seek完成后，如果之前处于播放状态，
-            // player重新进入播放状态
+            clearFrameQueue();
+
             {
                 QMutexLocker locker(&mutex);
-
-                if(playing){
-                    player->play();
-                }
+                playing = resume;
             }
-
+            emit seekFinished(resume);
             continue;
         }
 
-
-        // ===== 判断当前是否播放 =====
+        // ===== 3. 等待播放状态 =====
         {
             QMutexLocker locker(&mutex);
-
-            while(!playing && !stopRequested && !seekRequested){
-                condition.wait(&mutex);
-            }
-
-            if(stopRequested){
-                break;
-            }
+            while(!playing && !stopRequested && !seekRequested) condition.wait(&mutex);
+            if(stopRequested) break;
+            if(!playing) continue;              // 被 seek 唤醒，回到顶部
         }
 
-
-        // ===== 等待视频队列空间 =====
+        // ===== 4. 队列满：用条件变量真等待，不再 msleep 空转 =====
         {
             QMutexLocker locker(&queueMutex);
-
             while(frameQueue.size() >= MAX_QUEUE_SIZE){
-                {
-                    QMutexLocker stateLocker(&mutex);
-
-                    if(stopRequested){
-                        break;
-                    }
-
-                    if(!playing || seekRequested){
-                        break;
-                    }
-                }
-
-                queueNotFull.wait(&queueMutex);
+                // 50ms 超时 → 回主循环重新检查 stop / seek / playing
+                if(!queueNotFull.wait(&queueMutex, 50)) break;
             }
         }
 
-
-        if(isStopRequested()){
-            break;
-        }
-
-        // ===== 解码一帧视频 =====
+        // ===== 5. 解码一帧 =====
         QImage image;
-
         if(!player->decodeNextVideoFrame(image)){
-            // EOF或者暂时没有解码出帧
-            QThread::msleep(2);
+            if(player->isEndOfFile()){
+                // 播完了：停下来等 seek 或 stop，绝不再空转
+                {
+                    QMutexLocker locker(&mutex);
+                    playing = false;
+                }
+                emit decodeFinished();
+                continue;
+            }
+            QThread::msleep(2);                 // 仅"暂时没解出帧"才短暂让出
             continue;
         }
 
         double pts = player->getDecodedVideoPts();
 
-        // ===== 放入有限队列 =====
         {
             QMutexLocker locker(&queueMutex);
-
-            if(frameQueue.size() < MAX_QUEUE_SIZE){
+            if(frameQueue.size() < MAX_QUEUE_SIZE)
                 frameQueue.enqueue(qMakePair(image, pts));
-            }
         }
 
-        // ===== 通知GUI有新帧 =====
         emit frameAvailable();
     }
 

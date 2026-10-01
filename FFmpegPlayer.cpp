@@ -10,74 +10,72 @@
 #include <cstring>
 
 
-// 音频 PCM 缓冲设备
-// QAudioSink 从这里读取 PCM
-// FFmpeg 解码线程向这里写入 PCM
+// ============================================================
+// 音频 PCM 缓冲
+// QAudioSink（拉模式）从这里读取，解码线程往这里写
+//
+// 关键约定：
+//   1) readData() 永远返回 maxlen，不足部分补静音 —— 绝不返回 0。
+//      返回 0 会让 QAudioSink 判定"没有数据"并转入 IdleState 后不再拉取。
+//   2) 溢出时按"整帧"裁剪，绝不按任意字节裁剪，否则破坏 S16 样本对齐。
+//   3) 暂停/停止不在这里处理，交给 QAudioSink::suspend()/resume()。
+//       这样可以保证 processedUSecs() 在暂停期间不增长。
+// ============================================================
 class AudioBufferDevice : public QIODevice{
 public:
-    explicit AudioBufferDevice(QObject* parent = nullptr): QIODevice(parent), paused(true), maxBufferSize(1024 * 1024){
+    AudioBufferDevice(int channels, int sampleRate, QObject* parent = nullptr): QIODevice(parent),
+        m_channels(qMax(1, channels)),
+        m_sampleRate(qMax(1, sampleRate)),
+        m_frameBytes(m_channels * 2),                                  // S16 交错
+        m_maxBytes(qMax(m_frameBytes * 512,   m_sampleRate * m_channels * 2))                // 约 1 秒
+    {}
+
+    void openDevice(){
+        open(QIODevice::ReadOnly);
     }
 
-    void setPaused(bool value){
-        QMutexLocker locker(&mutex);
-
-        paused = value;
-
-        if(paused){
-            buffer.clear();
+    // ---- 解码线程调用 ----
+    void appendData(const QByteArray& pcm){
+        if(pcm.isEmpty()) return;
+        {
+            QMutexLocker locker(&m_mutex);
+            m_buffer.append(pcm);
+            if (m_buffer.size() > m_maxBytes){
+                int excess = m_buffer.size() - m_maxBytes;
+                // 向上对齐到整帧，保证声道/采样点不错位
+                int drop = ((excess + m_frameBytes - 1) / m_frameBytes) * m_frameBytes;
+                if(drop >= m_buffer.size()) m_buffer.clear();
+                else m_buffer.remove(0, drop);
+            }
         }
+        emit readyRead();
     }
 
     void clearBuffer(){
-        QMutexLocker locker(&mutex);
-        buffer.clear();
+        QMutexLocker locker(&m_mutex); m_buffer.clear();
     }
 
-    void appendData(const QByteArray& data){
-        if(data.isEmpty()) return;
-
-        QMutexLocker locker(&mutex);
-
-        if(paused) return;
-
-        // 限制最大缓冲区，防止解码速度过快导致内存无限增长
-        if(buffer.size() + data.size() > maxBufferSize){
-            int removeSize = buffer.size() + data.size() - maxBufferSize;
-
-            if(removeSize > 0 && removeSize < buffer.size()){
-                buffer.remove(0, removeSize);
-            }
-            else if(removeSize >= buffer.size()){
-                buffer.clear();
-            }
-        }
-
-        buffer.append(data);
+    qint64 bufferedBytes() const{
+        QMutexLocker locker(&m_mutex);
+        return m_buffer.size();
     }
 
 protected:
     qint64 readData(char* data, qint64 maxlen) override{
-        if(maxlen <= 0) return 0;
+        if (maxlen <= 0) return 0;
 
-        QMutexLocker locker(&mutex);
-
-        // 暂停时输出静音
-        if(paused || buffer.isEmpty()){
-            std::memset(data, 0, static_cast<size_t>(maxlen));
-            return maxlen;
+        qint64 n = 0;
+        {
+            QMutexLocker locker(&m_mutex);
+            n = qMin(maxlen, static_cast<qint64>(m_buffer.size()));
+            if(n > 0){
+                std::memcpy(data, m_buffer.constData(), static_cast<size_t>(n));
+                m_buffer.remove(0, static_cast<int>(n));
+            }
         }
 
-        qint64 readSize = qMin(maxlen, static_cast<qint64>(buffer.size()));
-
-        std::memcpy(data, buffer.constData(), static_cast<size_t>(readSize));
-
-        buffer.remove(0, static_cast<int>(readSize));
-
-        // 数据不足时补静音，避免 QAudioSink 进入 Idle
-        if(readSize < maxlen){
-            std::memset(data + readSize, 0, static_cast<size_t>(maxlen - readSize));
-        }
-
+        // 补齐静音并返回完整长度：QAudioSink 永远不会因读到 0 而进入 Idle
+        if(n < maxlen) std::memset(data + n, 0, static_cast<size_t>(maxlen - n));
         return maxlen;
     }
 
@@ -86,33 +84,24 @@ protected:
     }
 
     qint64 bytesAvailable() const override{
-        QMutexLocker locker(&mutex);
-
-        // 即使暂时没有 PCM，也让 QAudioSink 保持工作
-        return buffer.size() + 4096 + QIODevice::bytesAvailable();
+        QMutexLocker locker(&m_mutex);
+        return m_buffer.size() + QIODevice::bytesAvailable();
     }
 
 private:
-    mutable QMutex mutex;
-
-    QByteArray buffer;
-
-    bool paused;
-
-    const int maxBufferSize;
+    mutable QMutex m_mutex;
+    QByteArray m_buffer;
+    int m_channels;
+    int m_sampleRate;
+    int m_frameBytes;
+    int m_maxBytes;
 };
 
 
-FFmpegPlayer::FFmpegPlayer(): formatContext(nullptr),
-    videoCodecContext(nullptr), videoCodec(nullptr), videoStreamIndex(-1),
-    audioCodecContext(nullptr), audioCodec(nullptr), audioStreamIndex(-1),
-    swsContext(nullptr), swrContext(nullptr),
-    packet(nullptr), videoFrame(nullptr), audioFrame(nullptr),
-    opened(false), playing(false), endOfFile(false),
-    decodedVideoPts(0.0), currentVideoTime(0.0),
-    audioSink(nullptr), audioDevice(nullptr){
-}
 
+FFmpegPlayer::FFmpegPlayer(){
+
+}
 
 FFmpegPlayer::~FFmpegPlayer(){
     close();
@@ -125,146 +114,113 @@ FFmpegPlayer::~FFmpegPlayer(){
 bool FFmpegPlayer::open(const char* filename){
     close();
 
-    // ===== 打开文件 =====
+    if(!filename) return false;
+
     if(avformat_open_input(&formatContext, filename, nullptr, nullptr) < 0){
-        std::cerr << "Failed to open video file" << std::endl;
+        std::cerr << "Failed to open video file: " << filename << std::endl;
+        formatContext = nullptr;
         return false;
     }
-
-    // ===== 获取流信息 =====
     if(avformat_find_stream_info(formatContext, nullptr) < 0){
         std::cerr << "Failed to find stream info" << std::endl;
-
         close();
-
         return false;
     }
 
-    // ===== 查找视频流 =====
+    // ===== 起点偏移：部分文件首 PTS 不是 0 =====
+    startTimeOffset = (formatContext->start_time != AV_NOPTS_VALUE) ? formatContext->start_time / static_cast<double>(AV_TIME_BASE): 0.0;
+
+    // ===== 总时长缓存（避免跨线程读 formatContext） =====
+    cachedDuration.store((formatContext->duration != AV_NOPTS_VALUE) ? static_cast<double>(formatContext->duration) / AV_TIME_BASE: 0.0);
+
+    // ========================================================
+    // 视频
+    // ========================================================
     videoStreamIndex = av_find_best_stream(formatContext, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     if(videoStreamIndex < 0){
-        std::cerr << "No video stream found" << std::endl;
-
-        close();
-
+        std::cerr << "No video stream found" << std::endl; close();
         return false;
     }
 
-    // ===== 初始化视频解码器 =====
     AVStream* videoStream = formatContext->streams[videoStreamIndex];
-
     videoCodec = avcodec_find_decoder(videoStream->codecpar->codec_id);
     if(!videoCodec){
-        std::cerr << "Video decoder not found" << std::endl;
-
-        close();
-
+        std::cerr << "Video decoder not found" << std::endl; close();
         return false;
     }
-
 
     videoCodecContext = avcodec_alloc_context3(videoCodec);
     if(!videoCodecContext){
-        std::cerr << "Failed to allocate video codec context" << std::endl;
-
         close();
-
         return false;
     }
-
 
     if(avcodec_parameters_to_context(videoCodecContext, videoStream->codecpar) < 0){
-        std::cerr << "Failed to copy video codec parameters" << std::endl;
-
-        close();
-
+        std::cerr << "Failed to copy video codec parameters" << std::endl; close();
         return false;
     }
 
-
+    videoCodecContext->thread_count = 0;          // 自动多线程解码，明显提速
     if(avcodec_open2(videoCodecContext, videoCodec, nullptr) < 0){
         std::cerr << "Failed to open video decoder" << std::endl;
 
         close();
-
         return false;
     }
-
-
-    std::cout << "Video opened successfully" << std::endl;
-    std::cout << "Width: " << videoCodecContext->width << std::endl;
-    std::cout << "Height: " << videoCodecContext->height << std::endl;
-    std::cout << "Video stream index: " << videoStreamIndex << std::endl;
-
+    std::cout << "Video " << videoCodecContext->width << "x" << videoCodecContext->height << std::endl;
 
     // ========================================================
-    // 音频
+    // 音频：这里只打开解码器
+    // swr 和 QAudioSink 一律放到 initAudioOutput() 里建，
+    // 保证重采样器的输出参数与 audioFormat 永远一致（修 R3）
     // ========================================================
     audioStreamIndex = av_find_best_stream(formatContext, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
     if(audioStreamIndex >= 0){
         AVStream* audioStream = formatContext->streams[audioStreamIndex];
-
         audioCodec = avcodec_find_decoder(audioStream->codecpar->codec_id);
+
+        bool ok = false;
         if(audioCodec){
             audioCodecContext = avcodec_alloc_context3(audioCodec);
-            if(audioCodecContext){
-                if(avcodec_parameters_to_context(audioCodecContext, audioStream->codecpar) == 0){
-                    if(avcodec_open2(audioCodecContext, audioCodec, nullptr) == 0){
-                        std::cout << "Audio decoder opened successfully" << std::endl;
-
-                        std::cout << "Sample rate: " << audioCodecContext->sample_rate << std::endl;
-
-                        std::cout << "Channels: " << audioCodecContext->ch_layout.nb_channels << std::endl;
-                    }
-                }
-            }
+            ok = audioCodecContext && avcodec_parameters_to_context(audioCodecContext, audioStream->codecpar) == 0 && avcodec_open2(audioCodecContext, audioCodec, nullptr) == 0;
         }
+        if(!ok){
+            std::cerr << "Audio decoder unavailable, fallback to video-only" << std::endl;
+            if(audioCodecContext) avcodec_free_context(&audioCodecContext);
 
-
-        // ===== 创建音频重采样器 =====
-        if(audioCodecContext){
-            int ret = swr_alloc_set_opts2(&swrContext, &audioCodecContext->ch_layout, AV_SAMPLE_FMT_S16, audioCodecContext->sample_rate, &audioCodecContext->ch_layout, audioCodecContext->sample_fmt, audioCodecContext->sample_rate, 0,nullptr);
-            if(ret < 0 || !swrContext){
-                std::cerr << "Failed to create audio resampler" << std::endl;
-
-                swr_free(&swrContext);
-            }
-            else if(swr_init(swrContext) < 0){
-                std::cerr << "Failed to initialize audio resampler" << std::endl;
-
-                swr_free(&swrContext);
-            }
+            audioCodec = nullptr;
+            audioStreamIndex = -1;                 // 当作无音轨处理
+        }
+        else{
+            std::cout << "Audio " << audioCodecContext->sample_rate << "Hz " << audioCodecContext->ch_layout.nb_channels << "ch" << std::endl;
         }
     }
 
-    // FFmpeg对象
-    // ===== 分配Packet和Frame =====
     packet = av_packet_alloc();
     videoFrame = av_frame_alloc();
     audioFrame = av_frame_alloc();
-
-
     if(!packet || !videoFrame || !audioFrame){
-        std::cerr << "Failed to allocate FFmpeg packet/frame" << std::endl;
-
         close();
-
         return false;
     }
 
-
     {
         QMutexLocker locker(&stateMutex);
-
         opened = true;
-        playing = false;
         endOfFile = false;
-
-        decodedVideoPts = 0.0;
-        currentVideoTime = 0.0;
-        //audioClock = 0.0;
     }
 
+    playing = false;
+
+    {
+        QMutexLocker locker(&clockMutex);
+        clockBaseSeconds = 0.0;
+        clockRefUsecs    = 0;
+        wallAccumSeconds = 0.0;
+    }
+
+    wallTimer.invalidate();
+    decodedVideoPts.store(0.0);
 
     return true;
 }
@@ -276,23 +232,18 @@ bool FFmpegPlayer::open(const char* filename){
 void FFmpegPlayer::close(){
     {
         QMutexLocker locker(&stateMutex);
-
         opened = false;
-        playing = false;
-        endOfFile = true;
     }
 
+    playing = false;
+    endOfFile = true;
 
-    // ===== 音频 =====
-
+    // ===== 音频（GUI 线程调用） =====
     if(audioSink){
         audioSink->stop();
-
         delete audioSink;
-
         audioSink = nullptr;
     }
-
     if(audioDevice){
         audioDevice->close();
         delete audioDevice;
@@ -300,66 +251,39 @@ void FFmpegPlayer::close(){
     }
 
     // ===== Packet / Frame =====
-    if(packet){
-        av_packet_free(&packet);
-    }
-
-
-    if(videoFrame){
-        av_frame_free(&videoFrame);
-    }
-
-
-    if(audioFrame){
-        av_frame_free(&audioFrame);
-    }
-
+    if(packet) av_packet_free(&packet);
+    if(videoFrame) av_frame_free(&videoFrame);
+    if(audioFrame) av_frame_free(&audioFrame);
 
     // ===== 转换器 =====
-
     if(swsContext){
         sws_freeContext(swsContext);
-
         swsContext = nullptr;
     }
-
-
     if(swrContext){
         swr_free(&swrContext);
     }
-
+    swsSrcW = swsSrcH = 0;
+    swsSrcFmt = -1;
 
     // ===== 解码器 =====
-
-    if(videoCodecContext){
-        avcodec_free_context(&videoCodecContext);
-    }
-
-
-    if(audioCodecContext){
-        avcodec_free_context(&audioCodecContext);
-    }
-
+    if(videoCodecContext) avcodec_free_context(&videoCodecContext);
+    if(audioCodecContext) avcodec_free_context(&audioCodecContext);
 
     // ===== 文件 =====
-
-    if(formatContext){
-        avformat_close_input(&formatContext);
-    }
-
-
+    if(formatContext) avformat_close_input(&formatContext);
     formatContext = nullptr;
 
     videoCodec = nullptr;
     audioCodec = nullptr;
-
     videoStreamIndex = -1;
     audioStreamIndex = -1;
 
-    decodedVideoPts = 0.0;
-    currentVideoTime = 0.0;
-    //audioClock = 0.0;
+    cachedDuration.store(0.0);
+    decodedVideoPts.store(0.0);
+    wallTimer.invalidate();
 }
+
 
 
 // ============================================================
@@ -368,74 +292,58 @@ void FFmpegPlayer::close(){
 // ============================================================
 bool FFmpegPlayer::initAudioOutput(){
     if(!opened) return false;
-
-    if(audioStreamIndex < 0 || !audioCodecContext) return true;
-
-    // 已经初始化
-    if(audioSink) return true;
-
+    if(audioStreamIndex < 0 || !audioCodecContext) return true;   // 无音轨，正常
+    if(audioSink) return true;                                    // 已初始化
 
     QAudioDevice device = QMediaDevices::defaultAudioOutput();
-    if (!device.isNull()){
-        audioFormat = device.preferredFormat();
+    if(device.isNull()){
+        std::cerr << "No audio output device" << std::endl;
+        return false;
     }
 
-    // 使用 Int16 作为 FFmpeg → Qt 的统一 PCM 格式
-    audioFormat.setSampleFormat(QAudioFormat::Int16);
-    audioFormat.setSampleRate(audioCodecContext->sample_rate);
-    audioFormat.setChannelCount(audioCodecContext->ch_layout.nb_channels);
+    // ===== 1. 敲定"最终生效"的播放格式 =====
+    QAudioFormat fmt = device.preferredFormat();
+    fmt.setSampleFormat(QAudioFormat::Int16);
 
-    // 如果当前设备不支持这个格式
-    // 使用设备默认格式的采样率和声道数
-    if (!device.isNull() && !device.isFormatSupported(audioFormat)){
-        QAudioFormat fallback = device.preferredFormat();
+    // 尽量沿用文件采样率（少一次重采样）；声道数统一压到 2 以内
+    QAudioFormat fileFmt = fmt;
+    fileFmt.setSampleRate(audioCodecContext->sample_rate);
+    fileFmt.setChannelCount(qBound(1, audioCodecContext->ch_layout.nb_channels, 2));
+    if(device.isFormatSupported(fileFmt)) fmt = fileFmt;
+    else std::cout << "Device rejects file format, using preferred" << std::endl;
 
-        fallback.setSampleFormat(QAudioFormat::Int16);
+    audioFormat = fmt;
 
-        audioFormat = fallback;
+    // ===== 2. 以 audioFormat 为输出参数建重采样器（唯一一处建 swr） =====
+    if(swrContext){
+        swr_free(&swrContext);
     }
 
+    AVChannelLayout outLayout;
+    av_channel_layout_default(&outLayout, audioFormat.channelCount());
 
-    // 创建线程安全 PCM 缓冲
-    audioDevice = new AudioBufferDevice();
-    audioDevice->open(QIODevice::ReadOnly);
-    audioDevice->setPaused(true);
+    int ret = swr_alloc_set_opts2(&swrContext, &outLayout, AV_SAMPLE_FMT_S16, audioFormat.sampleRate(), &audioCodecContext->ch_layout, audioCodecContext->sample_fmt, audioCodecContext->sample_rate, 0, nullptr);
+    av_channel_layout_uninit(&outLayout);
+    if(ret < 0 || !swrContext){
+        std::cerr << "Failed to alloc audio resampler" << std::endl;
+        swrContext = nullptr;
+        return false;
+    }
+    if(swr_init(swrContext) < 0){
+        std::cerr << "Failed to init audio resampler" << std::endl;
+        swr_free(&swrContext);
+        return false;
+    }
 
+    // ===== 3. PCM 缓冲 =====
+    audioDevice = new AudioBufferDevice(audioFormat.channelCount(), audioFormat.sampleRate());
+    audioDevice->openDevice();
 
-    // 创建 QAudioSink
+    // ===== 4. Sink（注意：先不 start，等 play() 再启动） =====
     audioSink = new QAudioSink(device, audioFormat);
-    audioSink->setBufferSize(audioFormat.sampleRate() * audioFormat.channelCount() * 2 / 4);
+    audioSink->setBufferSize(qMax(audioFormat.bytesForDuration(200000), audioFormat.sampleRate() * audioFormat.channelCount() * 2 / 5));
 
-    // QAudioSink 在 GUI 线程工作
-    audioSink->start(audioDevice);
-
-
-    // 创建 FFmpeg 重采样器
-    // FFmpeg内部格式 → S16 PCM
-    if(!swrContext){
-        AVChannelLayout outputLayout;
-
-        av_channel_layout_default(&outputLayout, audioFormat.channelCount());
-
-        int ret = swr_alloc_set_opts2(&swrContext, &outputLayout, AV_SAMPLE_FMT_S16, audioFormat.sampleRate(), &audioCodecContext->ch_layout, audioCodecContext->sample_fmt, audioCodecContext->sample_rate, 0, nullptr);
-
-        av_channel_layout_uninit(&outputLayout);
-
-        if(ret < 0 || !swrContext){
-            std::cerr << "Failed to create audio resampler." << std::endl;
-
-            return false;
-        }
-
-        if(swr_init(swrContext) < 0){
-            std::cerr << "Failed to initialize audio resampler." << std::endl;
-
-            return false;
-        }
-    }
-
-    std::cout << "Audio output initialized." << std::endl;
-
+    std::cout << "Audio output ready: " << audioFormat.sampleRate() << "Hz " << audioFormat.channelCount() << "ch" << std::endl;
     return true;
 }
 
@@ -444,12 +352,31 @@ bool FFmpegPlayer::initAudioOutput(){
 // 播放
 // ============================================================
 void FFmpegPlayer::play(){
-    QMutexLocker locker(&stateMutex);
-
+    {
+        QMutexLocker locker(&stateMutex);
+        if(!opened) return;
+    }
     playing = true;
 
-    if(audioDevice){
-        audioDevice->setPaused(false);
+    if(audioSink){
+        switch(audioSink->state()){
+        case QAudio::StoppedState:
+        {
+            QMutexLocker locker(&clockMutex);
+            audioSink->start(audioDevice);
+            clockRefUsecs = audioSink->processedUSecs();   // 归零参考点
+        }
+        break;
+        case QAudio::SuspendedState:
+        case QAudio::IdleState:
+            audioSink->resume();
+            break;
+        default:
+            break;          // ActiveState
+        }
+    }
+    else if(!wallTimer.isValid()){
+        wallTimer.start();  // 无音轨：用单调墙钟兜底
     }
 }
 
@@ -458,12 +385,14 @@ void FFmpegPlayer::play(){
 // 暂停
 // ============================================================
 void FFmpegPlayer::pause(){
-    QMutexLocker locker(&stateMutex);
-
     playing = false;
 
-    if(audioDevice){
-        audioDevice->setPaused(true);
+    if(audioSink){
+        if(audioSink->state() == QAudio::ActiveState) audioSink->suspend();
+    }
+    else if(wallTimer.isValid()){
+        wallAccumSeconds += wallTimer.elapsed() / 1000.0;
+        wallTimer.invalidate();
     }
 }
 
@@ -472,19 +401,21 @@ void FFmpegPlayer::pause(){
 // 停止
 // ============================================================
 void FFmpegPlayer::stop(){
-    QMutexLocker locker(&stateMutex);
-
     playing = false;
 
-    if(audioDevice){
-        audioDevice->setPaused(true);
-        audioDevice->clearBuffer();
-    }
+    if(audioSink) audioSink->suspend();
+    if(audioDevice) audioDevice->clearBuffer();
 
     flushDecoders();
 
-    currentVideoTime = 0.0;
-    decodedVideoPts = 0.0;
+    {
+        QMutexLocker locker(&clockMutex);
+        clockBaseSeconds = 0.0;
+        clockRefUsecs    = audioSink ? audioSink->processedUSecs() : 0;
+        wallAccumSeconds = 0.0;
+    }
+    wallTimer.invalidate();
+    decodedVideoPts.store(0.0);
 }
 
 
@@ -492,91 +423,48 @@ void FFmpegPlayer::stop(){
 // 视频解码
 // ============================================================
 bool FFmpegPlayer::decodeNextVideoFrame(QImage& image){
-    if(!formatContext || !videoCodecContext || !packet || !videoFrame){
-        return false;
-    }
-
-
-    // ===== 确保音频输出已经建立 =====
-    if(audioCodecContext && !audioSink){
-        initAudioOutput();
-    }
-
+    if(!formatContext || !videoCodecContext || !packet || !videoFrame) return false;
 
     while(true){
         int ret = av_read_frame(formatContext, packet);
-
-        // ===== EOF =====
         if(ret < 0){
-            endOfFile = true;
-
+            endOfFile = true;          // 只有真正读到文件尾才置位
             return false;
         }
 
-        // ====================================================
-        // 音频Packet
-        // ====================================================
+        // ===== 音频包 =====
         if(packet->stream_index == audioStreamIndex){
             decodeAudioPacket(packet);
-
             av_packet_unref(packet);
-
             continue;
         }
 
-
-        // ====================================================
-        // 视频Packet
-        // ====================================================
+        // ===== 视频包 =====
         if(packet->stream_index == videoStreamIndex){
             ret = avcodec_send_packet(videoCodecContext, packet);
-
             av_packet_unref(packet);
 
-            if(ret < 0){
-                continue;
-            }
-
+            if(ret < 0 && ret != AVERROR(EAGAIN)) continue;
 
             while(true){
                 ret = avcodec_receive_frame(videoCodecContext, videoFrame);
-                if(ret == AVERROR(EAGAIN)){
-                    break;
-                }
-                if(ret == AVERROR_EOF){
-                    return false;
-                }
-                if(ret < 0){
-                    break;
-                }
+                if(ret == AVERROR(EAGAIN)) break;
+                if(ret == AVERROR_EOF) return false;
+                if(ret < 0) break;
 
-
-                // ===== 得到视频PTS =====
                 int64_t pts = videoFrame->best_effort_timestamp;
-                if(pts == AV_NOPTS_VALUE){
-                    pts = videoFrame->pts;
-                }
+                if(pts == AV_NOPTS_VALUE) pts = videoFrame->pts;
                 if(pts != AV_NOPTS_VALUE){
                     AVStream* stream = formatContext->streams[videoStreamIndex];
-
-                    decodedVideoPts = pts * av_q2d(stream->time_base);
-
-                    currentVideoTime = decodedVideoPts;
+                    decodedVideoPts.store(pts * av_q2d(stream->time_base) - startTimeOffset);
                 }
 
-
-                // ===== YUV -> RGB =====
-                if(!convertVideoFrame(videoFrame, image)){
-                    return false;
-                }
-
+                if(!convertVideoFrame(videoFrame, image)) return false;
                 return true;
             }
-
             continue;
         }
 
-        // ===== 其它流 =====
         av_packet_unref(packet);
     }
 }
@@ -586,28 +474,31 @@ bool FFmpegPlayer::decodeNextVideoFrame(QImage& image){
 // 视频格式转换
 // ============================================================
 bool FFmpegPlayer::convertVideoFrame(AVFrame* frame, QImage& image){
-    if(!frame){
-        return false;
-    }
+    if(!frame || frame->width <= 0 || frame->height <= 0) return false;
 
-    if(!swsContext){
+    // 分辨率/像素格式变化时重建 sws（原来只在 nullptr 时建，遇到可变分辨率会画花）
+    if(!swsContext || swsSrcW != frame->width || swsSrcH != frame->height || swsSrcFmt != frame->format){
+        if(swsContext){
+            sws_freeContext(swsContext);
+            swsContext = nullptr;
+        }
+
         swsContext = sws_getContext(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format), frame->width, frame->height, AV_PIX_FMT_RGB32, SWS_BILINEAR, nullptr, nullptr, nullptr);
-    }
+        if(!swsContext) return false;
 
-    if(!swsContext){
-        return false;
+        swsSrcW = frame->width;
+        swsSrcH = frame->height;
+        swsSrcFmt = frame->format;
     }
 
     QImage result(frame->width, frame->height, QImage::Format_RGB32);
 
     uint8_t* dstData[4] = {result.bits(), nullptr, nullptr, nullptr};
-
-    int dstLinesize[4] ={ static_cast<int>(result.bytesPerLine()), 0, 0, 0};
+    int dstLinesize[4] = {static_cast<int>(result.bytesPerLine()), 0, 0, 0};
 
     sws_scale(swsContext, frame->data, frame->linesize, 0, frame->height, dstData, dstLinesize);
 
-    image = result.copy();
-
+    image = result;  // QImage 隐式共享，零拷贝；原来的 result.copy() 是纯浪费
     return true;
 }
 
@@ -616,34 +507,17 @@ bool FFmpegPlayer::convertVideoFrame(AVFrame* frame, QImage& image){
 // 音频Packet解码
 // ============================================================
 bool FFmpegPlayer::decodeAudioPacket(AVPacket* packet){
-    if(!audioCodecContext || !audioFrame || !swrContext || !packet){
-        return false;
-    }
-
+    if(!audioCodecContext || !audioFrame || !packet) return false;
+    if(!swrContext || !audioDevice) return false;      // 音频链路未就绪
 
     int ret = avcodec_send_packet(audioCodecContext, packet);
-    if(ret < 0){
-        return false;
-    }
+    if(ret < 0 && ret != AVERROR(EAGAIN)) return false;
 
     bool decoded = false;
-
     while(true){
         ret = avcodec_receive_frame(audioCodecContext, audioFrame);
-        if(ret == AVERROR(EAGAIN)){
-            break;
-        }
-        if(ret == AVERROR_EOF){
-            break;
-        }
-        if(ret < 0){
-            break;
-        }
-
-
-        if(writeAudioFrame(audioFrame)){
-            decoded = true;
-        }
+        if(ret < 0) break;                             // EAGAIN / EOF 都退出
+        if(writeAudioFrame(audioFrame)) decoded = true;
     }
     return decoded;
 }
@@ -653,45 +527,29 @@ bool FFmpegPlayer::decodeAudioPacket(AVPacket* packet){
 // 写入音频 （音频帧 → PCM）
 // ============================================================
 bool FFmpegPlayer::writeAudioFrame(AVFrame* frame){
-    if (!swrContext || !audioDevice){
-        return true;
-    }
+    // 音频链路没建起来就静默跳过（不影响视频）
+    if(!swrContext || !audioDevice || !audioFormat.isValid()) return true;
 
-    int inputRate = audioCodecContext->sample_rate;
-    int outputRate = audioFormat.sampleRate();
-    int outputChannels = audioFormat.channelCount();
+    const int inRate = audioCodecContext->sample_rate;
+    const int outRate = audioFormat.sampleRate();
+    const int outCh  = audioFormat.channelCount();
+    const int bytesPerSample = 2;                     // S16
 
-
-    int64_t delay = swr_get_delay(swrContext, inputRate);
-
-    int outputSamples = static_cast<int>(av_rescale_rnd(delay + frame->nb_samples, outputRate, inputRate, AV_ROUND_UP));
-    if(outputSamples <= 0) return true;
-
-
-    int bytesPerSample = 2;
-
-    int bufferSize = outputSamples * outputChannels * bytesPerSample;
-
+    int64_t delay = swr_get_delay(swrContext, inRate);
+    int outSamples = static_cast<int>(av_rescale_rnd(delay + frame->nb_samples, outRate, inRate, AV_ROUND_UP));
+    if(outSamples <= 0) return true;
 
     QByteArray pcm;
-    pcm.resize(bufferSize);
+    pcm.resize(outSamples * outCh * bytesPerSample);
 
+    uint8_t* out[1] = {reinterpret_cast<uint8_t*>(pcm.data())};
 
-    uint8_t* outputData[1];
-    outputData[0] = reinterpret_cast<uint8_t*>(pcm.data());
-
-    int converted = swr_convert(swrContext, outputData, outputSamples, const_cast<const uint8_t**>(frame->extended_data), frame->nb_samples);
+    int converted = swr_convert(swrContext, out, outSamples, const_cast<const uint8_t**>(frame->extended_data), frame->nb_samples);
     if(converted <= 0) return true;
 
-
-    int actualSize = converted * outputChannels * bytesPerSample;
-
-    pcm.resize(actualSize);
-
-
-    // 送入线程安全 PCM 缓冲
+    // swr 的输出声道数 = audioFormat.channelCount()（因为 swr 就是用它建的）
+    pcm.resize(converted * outCh * bytesPerSample);
     audioDevice->appendData(pcm);
-
     return true;
 }
 
@@ -701,86 +559,90 @@ bool FFmpegPlayer::writeAudioFrame(AVFrame* frame){
 // 注意：这个函数现在只能由DecodeThread调用
 // ============================================================
 bool FFmpegPlayer::seek(double seconds){
-    if(!opened || !formatContext){
-        return false;
-    }
-
-
-    if(seconds < 0) seconds = 0;
+    if(!opened || !formatContext || videoStreamIndex < 0) return false;
 
     double duration = getDuration();
-    if(duration > 0 && seconds > duration){
-        seconds = duration;
-    }
-
-
-    // 清空已经缓存的音频
-    if(audioDevice){
-        audioDevice->clearBuffer();
-    }
-
+    if(seconds < 0.0) seconds = 0.0;
+    if(duration > 0.0 && seconds > duration) seconds = duration;
 
     AVStream* stream = formatContext->streams[videoStreamIndex];
+    int64_t timestamp = static_cast<int64_t>((seconds + startTimeOffset) / av_q2d(stream->time_base));
 
-    int64_t timestamp = static_cast<int64_t>(seconds / av_q2d(stream->time_base));
-
-    int ret = av_seek_frame(formatContext, videoStreamIndex, timestamp, AVSEEK_FLAG_BACKWARD);
-    if(ret < 0) return false;
+    if(av_seek_frame(formatContext, videoStreamIndex, timestamp, AVSEEK_FLAG_BACKWARD) < 0) return false;
 
     flushDecoders();
 
-    currentVideoTime = seconds;
-    decodedVideoPts = seconds;
-    endOfFile = false;
+    if(audioDevice) audioDevice->clearBuffer();
 
+    // 主时钟重置：seek 目标点成为新的时间原点
+    {
+        QMutexLocker locker(&clockMutex);
+        clockBaseSeconds = seconds;
+        clockRefUsecs = audioSink ? audioSink->processedUSecs() : 0;
+        wallAccumSeconds = 0.0;
+        if(wallTimer.isValid()) wallTimer.restart();
+    }
+
+    endOfFile = false;
+    decodedVideoPts.store(seconds);
     return true;
 }
+
 
 
 // ============================================================
 // 清空解码器
 // ============================================================
 void FFmpegPlayer::flushDecoders(){
-    if(videoCodecContext){
-        avcodec_flush_buffers(videoCodecContext);
-    }
-
-
-    if(audioCodecContext){
-        avcodec_flush_buffers(audioCodecContext);
-    }
-
+    if(videoCodecContext) avcodec_flush_buffers(videoCodecContext);
+    if(audioCodecContext) avcodec_flush_buffers(audioCodecContext);
 
     if(swrContext){
         swr_close(swrContext);
-
-        if(swr_init(swrContext) < 0){
-            std::cerr << "Failed to reinitialize audio resampler." << std::endl;
-        }
+        if(swr_init(swrContext) < 0) std::cerr << "Failed to reinit resampler" << std::endl;
     }
-
-
-    if(packet){
-        av_packet_unref(packet);
-    }
+    if(packet) av_packet_unref(packet);
 }
+
+
 
 
 // ============================================================
 // 获取视频PTS
 // ============================================================
 double FFmpegPlayer::getDecodedVideoPts() const{
-    return decodedVideoPts;
+    return decodedVideoPts.load();
 }
+
 
 
 // ============================================================
 // 获取当前播放时间
 // ============================================================
 double FFmpegPlayer::getCurrentTime() const{
-    QMutexLocker locker(&stateMutex);
+    double t = 0.0;
+    {
+        QMutexLocker locker(&clockMutex);
 
-    return currentVideoTime;
+        if(audioSink){
+            // 音频时钟：processedUSecs 在 suspend 期间不增长，天然支持暂停
+            double played = (audioSink->processedUSecs() - clockRefUsecs) / 1000000.0;
+            if(played < 0.0) played = 0.0;
+            t = clockBaseSeconds + played;
+        }else{
+            // 无音轨：单调墙钟兜底
+            double extra = wallAccumSeconds;
+            if(wallTimer.isValid()) extra += wallTimer.elapsed() / 1000.0;
+            t = clockBaseSeconds + extra;
+        }
+    }
+
+    double d = getDuration();
+    if(d > 0.0){
+        if(t < 0.0) t = 0.0;
+        if(t > d) t = d;      // 防止片尾静音把进度条冲出界
+    }
+    return t;
 }
 
 
@@ -788,15 +650,7 @@ double FFmpegPlayer::getCurrentTime() const{
 // 获取总时长
 // ============================================================
 double FFmpegPlayer::getDuration() const{
-    if(!formatContext){
-        return 0.0;
-    }
-
-    if(formatContext->duration == AV_NOPTS_VALUE){
-        return 0.0;
-    }
-
-    return static_cast<double>(formatContext->duration) / AV_TIME_BASE;
+    return cachedDuration.load();
 }
 
 
@@ -804,15 +658,10 @@ double FFmpegPlayer::getDuration() const{
 // 获取帧率
 // ============================================================
 double FFmpegPlayer::getFrameRate() const{
-    if(!formatContext || videoStreamIndex < 0){
-        return 0.0;
-    }
-
-    AVStream* stream = formatContext->streams[videoStreamIndex];
-
-    if(stream->avg_frame_rate.den == 0) return 0.0;
-
-    return av_q2d(stream->avg_frame_rate);
+    if(!formatContext || videoStreamIndex < 0) return 0.0;
+    AVRational r = formatContext->streams[videoStreamIndex]->avg_frame_rate;
+    if(r.den == 0 || r.num == 0) return 0.0;
+    return av_q2d(r);
 }
 
 
@@ -820,20 +669,15 @@ double FFmpegPlayer::getFrameRate() const{
 // 状态
 // ============================================================
 bool FFmpegPlayer::isPlaying() const{
-    QMutexLocker locker(&stateMutex);
-
-    return playing;
+    return playing.load();
 }
 
-
-bool FFmpegPlayer::isOpened() const{
+bool FFmpegPlayer::isOpened() const {
     QMutexLocker locker(&stateMutex);
-
     return opened;
 }
 
-// bool FFmpegPlayer::isEndOfFile() const{
-//     QMutexLocker locker(&stateMutex);
-
-//     return endOfFile;
-// }
+bool FFmpegPlayer::isEndOfFile() const {
+    QMutexLocker locker(&stateMutex);
+    return opened && endOfFile.load();
+}

@@ -192,7 +192,12 @@ void MainWindow::showRoomPage(){
     stackedWidget->setCurrentWidget(roomPage);
 }
 void MainWindow::showCinemaPage(){
+    // 首次进入时打开片源；后续进入保留当前播放状态
+    if(!cinemaPage->isVideoReady()){
+        cinemaPage->openVideo(QString());     // 空 → 弹文件选择框
+    }
     stackedWidget->setCurrentWidget(cinemaPage);
+
 }
 void MainWindow::showLoginPage(){
     stackedWidget->setCurrentWidget(loginPage);
